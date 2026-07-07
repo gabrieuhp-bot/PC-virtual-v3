@@ -1,0 +1,298 @@
+
+name: RDP
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. LIBERAR ESPACIO Y MONTAR DISCO EXTRA
+      # ─────────────────────────────────────────────
+      - name: Free Up Space & Mount Extra Disk
+        run: |
+          Write-Host "=== Disk before cleanup ===" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          $toRemove = @(
+            "$env:SystemDrive\hostedtoolcache\windows\Ruby",
+            "$env:SystemDrive\hostedtoolcache\windows\go",
+            "$env:SystemDrive\hostedtoolcache\windows\Python",
+            "$env:ProgramFiles\dotnet",
+            "$env:ProgramFiles\MongoDB",
+            "$env:ProgramFiles\PostgreSQL",
+            "$env:ProgramFiles (x86)\Google\Chrome",
+            "$env:ProgramFiles\Mozilla Firefox"
+          )
+          foreach ($path in $toRemove) {
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Removed: $path" -ForegroundColor Green
+            }
+          }
+
+          Write-Host "=== Disk D: info ===" -ForegroundColor Cyan
+          Get-PSDrive D -ErrorAction SilentlyContinue
+
+          $vhdPath = "D:\extra_disk.vhdx"
+          New-VHD -Path $vhdPath -SizeBytes 100GB -Dynamic -ErrorAction SilentlyContinue
+          Mount-VHD -Path $vhdPath
+          $disk = Get-Disk | Where-Object { $_.OperationalStatus -eq 'Online' -and $_.PartitionStyle -eq 'RAW' } | Select-Object -Last 1
+          if ($disk) {
+            Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru |
+              New-Partition -AssignDriveLetter -UseMaximumSize |
+              Format-Volume -FileSystem NTFS -NewFileSystemLabel "ExtraDisk" -Confirm:$false
+          }
+
+          Write-Host "=== Disk after setup ===" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          "EXTRA_DISK=E:" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "STORAGE_ROOT=D:\storage" | Out-File -FilePath $env:GITHUB_ENV -Append
+          New-Item -ItemType Directory -Force -Path "D:\storage" | Out-Null
+
+      # ─────────────────────────────────────────────
+      # 2. INSTALAR MESA3D (OpenGL SOFTWARE RENDERER)
+      # ─────────────────────────────────────────────
+      - name: Install Mesa3D OpenGL (Software GPU)
+        run: |
+          $mesaUrl = "https://github.com/pal1000/mesa-dist-win/releases/download/24.3.4/mesa3d-24.3.4-release-mingw.7z"
+          $sevenZipUrl = "https://www.7-zip.org/a/7zr.exe"
+          
+          Invoke-WebRequest -Uri $sevenZipUrl -OutFile "$env:TEMP\7zr.exe" -UseBasicParsing
+          
+          Write-Host "Downloading Mesa3D..." -ForegroundColor Cyan
+          Invoke-WebRequest -Uri $mesaUrl -OutFile "$env:TEMP\mesa3d.7z" -UseBasicParsing
+          
+          $mesaDir = "C:\mesa3d"
+          New-Item -ItemType Directory -Force -Path $mesaDir | Out-Null
+          & "$env:TEMP\7zr.exe" x "$env:TEMP\mesa3d.7z" -o"$mesaDir" -y | Out-Null
+          
+          $installScript = Get-ChildItem -Path $mesaDir -Filter "systemwidedeploy.cmd" -Recurse | Select-Object -First 1
+          if ($installScript) {
+            Write-Host "Installing Mesa3D system-wide..." -ForegroundColor Cyan
+            & cmd /c "`"$($installScript.FullName)`" x64"
+          } else {
+            $x64dir = Get-ChildItem -Path $mesaDir -Filter "x64" -Recurse -Directory | Select-Object -First 1
+            if ($x64dir) {
+              Copy-Item "$($x64dir.FullName)\opengl32.dll" "C:\Windows\System32\" -Force
+              Copy-Item "$($x64dir.FullName)\*.dll" "C:\Windows\System32\" -Force -ErrorAction SilentlyContinue
+            }
+          }
+          
+          $openglDll = Test-Path "C:\Windows\System32\opengl32.dll"
+          Write-Host "OpenGL DLL present: $openglDll" -ForegroundColor Green
+          
+          $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          Invoke-WebRequest -Uri $vcUrl -OutFile "$env:TEMP\vc_redist.x64.exe" -UseBasicParsing
+          Start-Process "$env:TEMP\vc_redist.x64.exe" -ArgumentList "/quiet", "/norestart" -Wait
+          
+          Write-Host "Mesa3D (software OpenGL) installed successfully" -ForegroundColor Green
+
+     
+      # ─────────────────────────────────────────────
+      # 8. INSTALAR OPERA GX
+      # ─────────────────────────────────────────────
+      - name: Install Opera GX
+        run: |
+          Write-Host "=== Installing Opera GX ===" -ForegroundColor Cyan
+          $operaUrl = "https://net.geo.opera.com/opera_gx/stable/windows"
+          $installer = "$env:TEMP\OperaGXSetup.exe"
+          
+          Invoke-WebRequest -Uri $operaUrl -OutFile $installer -UseBasicParsing
+          
+          Start-Process $installer -ArgumentList "/silent", "/allusers=1", "/launchopera=0", "/setdefaultbrowser=0", "/desktopshortcut=0", "/enable-stats=0", "/enable-installer-stats=0" -Wait
+          
+          $operaPath = "${env:ProgramFiles}\Opera GX\launcher.exe"
+          if (Test-Path $operaPath) {
+            Write-Host "Opera GX installed at: $operaPath" -ForegroundColor Green
+          } else {
+            Write-Warning "Opera GX installation path not found, checking alternatives..."
+            Get-ChildItem -Path "${env:ProgramFiles}" -Filter "*opera*" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 FullName
+          }
+          
+          Write-Host "Opera GX installed successfully" -ForegroundColor Green
+
+      # ─────────────────────────────────────────────
+      # 9. CONFIGURAR RDP
+      # ─────────────────────────────────────────────
+      - name: Configure RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured." -ForegroundColor Green
+
+      # ─────────────────────────────────────────────
+      # 10. CREAR USUARIO RDP
+      # ─────────────────────────────────────────────
+      - name: Create RDP User
+        run: |
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+          }
+          $rawPassword  = @()
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators"        -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users"  -Member "RDP" -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"; exit 1
+          }
+
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "RDP user created." -ForegroundColor Green
+
+      # ─────────────────────────────────────────────
+      # 11. INSTALAR TAILSCALE
+      # ─────────────────────────────────────────────
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$installer`"","/quiet","/norestart" -Wait
+          Remove-Item $installer -Force
+
+      # ─────────────────────────────────────────────
+      # 12. CONECTAR TAILSCALE
+      # ─────────────────────────────────────────────
+      - name: Connect Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+            Start-Sleep -Seconds 4
+            $tsIP = & $ts ip -4 2>$null
+            $retries++
+          }
+
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale IP: $tsIP" -ForegroundColor Green
+
+      # ─────────────────────────────────────────────
+      # 13. VERIFICAR RDP
+      # ─────────────────────────────────────────────
+      - name: Verify RDP
+        run: |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "RDP port 3389 not reachable"; exit 1
+          }
+          Write-Host "RDP reachable on port 3389 ✓" -ForegroundColor Green
+
+      # ─────────────────────────────────────────────
+      # 14. VERIFICAR APLICACIONES INSTALADAS
+      # ─────────────────────────────────────────────
+      - name: Verify Installed Apps
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║         VERIFICATION REPORT                      ║" -ForegroundColor Cyan
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          
+          Write-Host "║  NODE.JS:" -NoNewline
+          try { node --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║  NPM:    " -NoNewline
+          try { npm --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║  OPENCODE-AI:" -NoNewline
+          try { opencode --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║  PYTHON:" -NoNewline
+          try { 
+            $py = Get-Command python -ErrorAction SilentlyContinue
+            if ($py) { & $py.Source --version 2>$null; Write-Host " ✓" -ForegroundColor Green }
+            else { Write-Host " ✗" -ForegroundColor Red }
+          } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║  PIP:    " -NoNewline
+          try { 
+            $pip = Get-Command pip -ErrorAction SilentlyContinue
+            if ($pip) { & $pip.Source --version 2>$null; Write-Host " ✓" -ForegroundColor Green }
+            else { 
+              $py = Get-Command python -ErrorAction SilentlyContinue
+              if ($py) { & $py.Source -m pip --version 2>$null; Write-Host " ✓ (via python -m pip)" -ForegroundColor Green }
+              else { Write-Host " ✗" -ForegroundColor Red }
+            }
+          } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║  GIT:   " -NoNewline
+          try { git --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║  FLUTTER:" -NoNewline
+          try { flutter --version 2>$null | Select-Object -First 1; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "║  OPERA GX:" -NoNewline
+          $operaExe = "${env:ProgramFiles}\Opera GX\launcher.exe"
+          if (Test-Path $operaExe) { Write-Host " ✓" -ForegroundColor Green } else { Write-Host " ✗" -ForegroundColor Red }
+          
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+
+      # ─────────────────────────────────────────────
+      # 15. MANTENER SESIÓN ACTIVA
+      # ─────────────────────────────────────────────
+      - name: Keep Alive & Show Credentials
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║         RDP ACCESS INFO                          ║" -ForegroundColor Cyan
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║  IP:       $env:TAILSCALE_IP"
+          Write-Host "║  User:     RDP"
+          Write-Host "║  Password: $env:RDP_PASSWORD"
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║  STORAGE                                         ║" -ForegroundColor Cyan
+          Write-Host "║  C: ~14GB (sistema)                              ║"
+          Write-Host "║  D: ~70GB (runner disk)                          ║"
+          Write-Host "║  E: ~100GB (VHD extra)                           ║"
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║  GPU: Mesa3D Software OpenGL 3.x                 ║"
+          Write-Host "║  (permite Minecraft, VSCode, etc.)               ║"
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+          Write-Host "║  INSTALLED APPS                                  ║" -ForegroundColor Cyan
+          Write-Host "║  • Node.js 22 LTS + npm                          ║"
+          Write-Host "║  • OpenCode AI (npm global)                      ║"
+          Write-Host "║  • Python 3.12 + pip                             ║"
+          Write-Host "║  • Git for Windows 2.54                          ║"
+          Write-Host "║  • Flutter SDK (stable) + Dart                   ║"
+          Write-Host "║  • Opera GX (navegador gamer)                    ║"
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+
+          $i = 0
+          while ($true) {
+            $i++
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active — tick $i" -ForegroundColor DarkGray
+            Get-PSDrive -PSProvider FileSystem | Select-Object Name,
+              @{N='Free(GB)';E={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+            Start-Sleep -Seconds 300
+          }
